@@ -58,6 +58,7 @@ class StratumRPCMiningProvider(object):
     def rpc_submit(self, worker_name, job_id, extranonce2, ntime, nonce, *args):
         if job_id not in self.handler_map:
             print >>sys.stderr, '''Couldn't link returned work's job id with its handler. This should only happen if this process was recently restarted!'''
+            #self.other.svc_client.rpc_reconnect().addErrback(lambda err: None)
             return False
         x, got_response = self.handler_map[job_id]
         coinb_nonce = extranonce2.decode('hex')
@@ -66,7 +67,7 @@ class StratumRPCMiningProvider(object):
         header = dict(
             version=x['version'],
             previous_block=x['previous_block'],
-            merkle_root=bitcoin_data.check_merkle_link(bitcoin_data.hash256(new_packed_gentx), x['merkle_link']),
+            merkle_root=bitcoin_data.check_merkle_link(bitcoin_data.hash256(new_packed_gentx), x['merkle_link']), # new_packed_gentx has witness data stripped
             timestamp=pack.IntType(32).unpack(getwork._swap4(ntime.decode('hex'))),
             bits=x['bits'],
             nonce=pack.IntType(32).unpack(getwork._swap4(nonce.decode('hex'))),

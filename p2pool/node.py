@@ -17,7 +17,8 @@ class P2PNode(p2p.Node):
             best_share_hash_func=lambda: node.best_share_var.value,
             net=node.net,
             known_txs_var=node.known_txs_var,
-            mining_txs_var=node.mining_txs_var,
+            mining_txs_var=node.mining_txs_var,   # transactions from getblocktemplate
+            mining2_txs_var=node.mining2_txs_var, # transactions sent to miners
         **kwargs)
     
     def handle_shares(self, shares, peer):
@@ -40,9 +41,7 @@ class P2PNode(p2p.Node):
             
             self.node.tracker.add(share)
         
-        new_known_txs = dict(self.node.known_txs_var.value)
-        new_known_txs.update(all_new_txs)
-        self.node.known_txs_var.set(new_known_txs)
+        self.node.known_txs_var.add(all_new_txs)
         
         if new_count:
             self.node.set_best_share()
@@ -80,7 +79,7 @@ class P2PNode(p2p.Node):
         return shares
     
     def handle_bestblock(self, header, peer):
-        if self.node.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(header)) > header['bits'].target:
+        if bitcoin_data.hashx11(bitcoin_data.block_header_type.pack(header)) > header['bits'].target:
             raise p2p.PeerMisbehavingError('received block header fails PoW test')
         self.node.handle_header(header)
     
@@ -162,8 +161,20 @@ class Node(object):
         self.bitcoind = bitcoind
         self.net = net
         
+
+        self.known_txs_var = variable.VariableDict({}) # hash -> tx
+        self.mining_txs_var = variable.Variable({}) # hash -> tx
+        self.mining2_txs_var = variable.Variable({}) # hash -> tx
+        self.best_share_var = variable.Variable(None)
+        self.desired_var = variable.Variable(None)
+        self.txidcache = {}
+        self.feecache = {}
+        self.feefifo = []
+        self.punish = False
+
         self.tracker = p2pool_data.OkayTracker(self.net)
         
+
         for share in shares:
             self.tracker.add(share)
         
@@ -186,7 +197,7 @@ class Node(object):
             while stop_signal.times == 0:
                 flag = self.factory.new_block.get_deferred()
                 try:
-                    self.bitcoind_work.set((yield helper.getwork(self.bitcoind, self.bitcoind_work.value['use_getblocktemplate'])))
+                    self.bitcoind_work.set((yield helper.getwork(self.bitcoind, self.bitcoind_work.value['use_getblocktemplate'], self.txidcache, self.feecache, self.feefifo, self.known_txs_var.value)))
                 except:
                     log.err()
                 yield defer.DeferredList([flag, deferral.sleep(15)], fireOnOneCallback=True)
@@ -195,24 +206,18 @@ class Node(object):
         # PEER WORK
         
         self.best_block_header = variable.Variable(None)
-        self.pow_subsidy = 0
         def handle_header(new_header):
-            self.pow_bits = self.bitcoind_work.value['bits']
-            self.pow_subsidy = self.bitcoind_work.value['subsidy']
-
             # check that header matches current target
-            if not (self.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(new_header)) <= self.bitcoind_work.value['bits'].target):
+            if not (bitcoin_data.hashx11(bitcoin_data.block_header_type.pack(new_header)) <= self.bitcoind_work.value['bits'].target):
                 return
             bitcoind_best_block = self.bitcoind_work.value['previous_block']
             if (self.best_block_header.value is None
                 or (
                     new_header['previous_block'] == bitcoind_best_block and
-                    #bitcoin_data.hash256(bitcoin_data.block_header_type.pack(self.best_block_header.value)) == bitcoind_best_block
-                    self.net.PARENT.BLOCKHASH_FUNC(bitcoin_data.block_header_type.pack(self.best_block_header.value)) == bitcoind_best_block
+                    bitcoin_data.hashx11(bitcoin_data.block_header_type.pack(self.best_block_header.value)) == bitcoind_best_block
                 ) # new is child of current and previous is current
                 or (
-                    #bitcoin_data.hash256(bitcoin_data.block_header_type.pack(new_header)) == bitcoind_best_block and
-                    self.net.PARENT.BLOCKHASH_FUNC(bitcoin_data.block_header_type.pack(new_header)) == bitcoind_best_block and
+                    bitcoin_data.hashx11(bitcoin_data.block_header_type.pack(new_header)) == bitcoind_best_block and
                     self.best_block_header.value['previous_block'] != bitcoind_best_block
                 )): # new is current and previous is not a child of current
                 self.best_block_header.set(new_header)
@@ -227,12 +232,7 @@ class Node(object):
         
         # BEST SHARE
         
-        self.known_txs_var = variable.Variable({}) # hash -> tx
-        self.mining_txs_var = variable.Variable({}) # hash -> tx
-        self.get_height_rel_highest = yield height_tracker.get_height_rel_highest_func(self.bitcoind, self.factory, lambda: self.bitcoind_work.value['previous_block'], self.net)
-        
-        self.best_share_var = variable.Variable(None)
-        self.desired_var = variable.Variable(None)
+        self.get_height_rel_highest, self.get_height = yield height_tracker.get_height_funcs(self.bitcoind, self.factory, lambda: self.bitcoind_work.value['previous_block'], self.net)
         self.bitcoind_work.changed.watch(lambda _: self.set_best_share())
         self.set_best_share()
         
@@ -241,19 +241,16 @@ class Node(object):
         # update mining_txs according to getwork results
         @self.bitcoind_work.changed.run_and_watch
         def _(_=None):
-            new_mining_txs = {}
-            new_known_txs = dict(self.known_txs_var.value)
-            for tx_hash, tx in zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']):
-                new_mining_txs[tx_hash] = tx
-                new_known_txs[tx_hash] = tx
+            new_mining_txs = dict(zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']))
+            added_known_txs = {hsh:tx for hsh,tx in new_mining_txs.iteritems() if not hsh in self.known_txs_var.value}
             self.mining_txs_var.set(new_mining_txs)
-            self.known_txs_var.set(new_known_txs)
+            self.known_txs_var.add(added_known_txs)
         # add p2p transactions from bitcoind to known_txs
         @self.factory.new_tx.watch
         def _(tx):
-            new_known_txs = dict(self.known_txs_var.value)
-            new_known_txs[bitcoin_data.hash256(bitcoin_data.tx_type.pack(tx))] = tx
-            self.known_txs_var.set(new_known_txs)
+            self.known_txs_var.add({
+                bitcoin_data.hash256(bitcoin_data.tx_type.pack(tx)): tx,
+            })
         # forward transactions seen to bitcoind
         @self.known_txs_var.transitioned.watch
         @defer.inlineCallbacks
@@ -284,6 +281,7 @@ class Node(object):
                 for peer in self.p2p_node.peers.itervalues():
                     new_known_txs.update(peer.remembered_txs)
             new_known_txs.update(self.mining_txs_var.value)
+            new_known_txs.update(self.mining2_txs_var.value)
             for share in self.tracker.get_chain(self.best_share_var.value, min(120, self.tracker.get_height(self.best_share_var.value))):
                 for tx_hash in share.new_transaction_hashes:
                     if tx_hash in self.known_txs_var.value:
@@ -298,8 +296,11 @@ class Node(object):
         stop_signal.watch(t.stop)
     
     def set_best_share(self):
-        best, desired, decorated_heads, bad_peer_addresses = self.tracker.think(self.get_height_rel_highest, self.bitcoind_work.value['previous_block'], self.bitcoind_work.value['bits'], self.known_txs_var.value)
-        
+        oldpunish = self.punish
+        best, desired, decorated_heads, bad_peer_addresses, self.punish= self.tracker.think(self.get_height_rel_highest, self.get_height, self.bitcoind_work.value['previous_block'], self.bitcoind_work.value['bits'], self.known_txs_var.value, self.feecache)
+        if self.punish and not oldpunish and best == self.best_share_var.value: # need to reissue work with lower difficulty
+            self.best_share_var.changed.happened(best) # triggers wb.new_work_event to reissue work
+
         self.best_share_var.set(best)
         self.desired_var.set(desired)
         if self.p2p_node is not None:
@@ -314,7 +315,7 @@ class Node(object):
         return p2pool_data.get_expected_payouts(self.tracker, self.best_share_var.value, self.bitcoind_work.value['bits'].target, self.bitcoind_work.value['subsidy'], self.net)
     
     def clean_tracker(self):
-        best, desired, decorated_heads, bad_peer_addresses = self.tracker.think(self.get_height_rel_highest, self.bitcoind_work.value['previous_block'], self.bitcoind_work.value['bits'], self.known_txs_var.value)
+        best, desired, decorated_heads, bad_peer_addresses, self.punish = self.tracker.think(self.get_height_rel_highest, self.get_height, self.bitcoind_work.value['previous_block'], self.bitcoind_work.value['bits'], self.known_txs_var.value, self.feecache)
         
         # eat away at heads
         if decorated_heads:

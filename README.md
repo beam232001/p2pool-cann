@@ -1,7 +1,7 @@
 Requirements:
 -------------------------
 Generic:
-* CannabisCoin >= 0.8.7.1
+* CannabisCoin >= 0.13.0
 * Python >=2.6
 * Twisted >=10.0.0
 * python-argparse (for Python =2.6)
